@@ -3,12 +3,166 @@
 #![allow(non_snake_case)]
 #![allow(dead_code)]
 
+use core::ops::{Deref, DerefMut};
+use std::ffi::c_void;
+
 include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
+
+pub trait ASN1GenType {
+    /// Get the address of the static descriptor created by the generated code
+    unsafe fn get_descriptor() -> &'static asn_TYPE_descriptor_t;
+}
+
+enum AllocatedData<T: Sized + ASN1GenType> {
+    /// The type is allocated by Rust.
+    RustAllocated(*mut T),
+    /// This is used for received data. The codec  uses its own
+    /// allocator and does not allow us to provide our own.
+    Asn1CodecAllocated(*mut T),
+}
+
+pub struct ASNBox<T>(AllocatedData<T>)
+where
+    T: Sized + ASN1GenType;
+
+impl<T> ASNBox<T>
+where
+    T: Sized + ASN1GenType,
+{
+    /// Create a boxed DDS type from a buffer that is allocated by
+    pub unsafe fn new_from_asn1codec_allocated_struct(p: *mut T) -> Self {
+        if !p.is_null() {
+            Self(AllocatedData::<T>::Asn1CodecAllocated(p))
+        } else {
+            panic!("Tried to create ASNBox from null pointer");
+        }
+    }
+
+    /// Build a ASNBox from a heap allocated DDSStructure
+    pub fn new_from_box(b: Box<T>) -> Self {
+        Self(AllocatedData::RustAllocated(Box::into_raw(b)))
+    }
+
+    pub unsafe fn get_raw_mut_ptr(&self) -> *mut std::ffi::c_void {
+        match self.0 {
+            AllocatedData::Asn1CodecAllocated(p) => p as *mut std::ffi::c_void,
+            AllocatedData::RustAllocated(p) => p as *mut std::ffi::c_void,
+        }
+    }
+}
+
+impl<T> Drop for ASNBox<T>
+where
+    T: Sized + ASN1GenType,
+{
+    fn drop(&mut self) {
+        match self.0 {
+            AllocatedData::Asn1CodecAllocated(p) => unsafe {
+                let mut descriptor = T::get_descriptor();
+                let ops = descriptor.op.as_ref().unwrap();
+                let free_fn = ops.free_struct.unwrap();
+                free_fn(
+                    descriptor,
+                    p as *mut ::std::os::raw::c_void,
+                    asn_struct_free_method_ASFM_FREE_EVERYTHING,
+                );
+            },
+            AllocatedData::RustAllocated(p) => {
+                Box::from(p); // The box will go out of scope immediately and release p
+            }
+        }
+    }
+}
+
+impl<T> Deref for ASNBox<T>
+where
+    T: Sized + ASN1GenType,
+{
+    type Target = T;
+    fn deref(&self) -> &T {
+        match self.0 {
+            AllocatedData::Asn1CodecAllocated(p) => unsafe { &*p as &T },
+            AllocatedData::RustAllocated(p) => unsafe { &*p as &T },
+        }
+    }
+}
+
+impl<T> DerefMut for ASNBox<T>
+where
+    T: Sized + ASN1GenType,
+{
+    fn deref_mut(&mut self) -> &mut T {
+        match self.0 {
+            AllocatedData::Asn1CodecAllocated(p) => unsafe { &mut *p },
+            AllocatedData::RustAllocated(p) => unsafe { &mut *p },
+        }
+    }
+}
+
+/// Try to decode a buffer into the type specified by the type of the function.
+pub fn uper_decode_full<T>(buffer: &[u8]) -> Option<ASNBox<T>>
+where
+    T: Sized + ASN1GenType,
+{
+    let codec_ctx = asn_codec_ctx_t { max_stack_size: 0 };
+    // set to NULL so ASN1 codec will allocate the structure
+    // there may be a cleaner way to do this - but this is what I could
+    // manage for now.
+    let mut voidp: *mut c_void = std::ptr::null::<ShortMsgNpdu_t>() as *mut c_void;
+    let voidpp: *mut *mut c_void = &mut voidp;
+
+    unsafe {
+        let rval = uper_decode_complete(
+            &codec_ctx as *const _,
+            T::get_descriptor(),
+            voidpp,
+            buffer.as_ptr() as *const ::std::os::raw::c_void,
+            buffer.len() as u64,
+        );
+        if rval.code != asn_dec_rval_code_e_RC_OK {
+            None
+        } else {
+            let msg = ASNBox::<T>::new_from_asn1codec_allocated_struct(voidp as *mut T);
+            Some(msg)
+        }
+    }
+}
+
+/// Encode a structure into a byte array. The buffer must be large
+/// enough for the data. If successful, returns a slice into the
+/// input slice.
+pub fn uper_encode_full<'a, T>(msg: &T, buffer: &'a mut [u8]) -> Option<&'a [u8]>
+where
+    T: Sized + ASN1GenType,
+{
+    let message_ptr: *const c_void = msg as *const _ as *const c_void;
+    let encode_buffer_ptr: *mut c_void = buffer.as_mut_ptr() as *mut _ as *mut c_void;
+
+    unsafe {
+        let enc_rval = uper_encode_to_buffer(
+            T::get_descriptor(),
+            std::ptr::null(),
+            message_ptr,
+            encode_buffer_ptr,
+            buffer.len() as u64,
+        );
+        if enc_rval.encoded > 0 {
+            println!(
+                "Success! encoded ShortMsgNpdu, {} bytes {} bits",
+                enc_rval.encoded / 8,
+                enc_rval.encoded % 8,
+            );
+            let num_bytes = (enc_rval.encoded / 8) as usize;
+            Some(&buffer[0..num_bytes])
+        } else {
+            None
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::c_void;
     fn new_context() -> asn_struct_ctx_t {
         let ctx_struct: asn_struct_ctx_t = asn_struct_ctx_t {
             phase: 0,
@@ -66,7 +220,7 @@ mod tests {
     }
 
     #[test]
-    fn encode_short_msg_n_pdu() {
+    fn loopback_short_msg_n_pdu() {
         let mut data = vec![0xFEu8; 10];
         let version = 2;
         let dest_address = 12;
@@ -74,28 +228,20 @@ mod tests {
 
         let mut short_msg = create_short_msg_npdu(&mut data, version, dest_address);
 
-        let message_ptr: *mut c_void = &mut short_msg as *mut _ as *mut c_void;
-        let encode_buffer_ptr: *mut c_void = encoded_data.as_mut_ptr() as *mut _ as *mut c_void;
-
-        unsafe {
-            let enc_rval = uper_encode_to_buffer(
-                &asn_DEF_ShortMsgNpdu,
-                std::ptr::null(),
-                message_ptr,
-                encode_buffer_ptr,
-                encoded_data.len() as u64,
-            );
-            if enc_rval.encoded > 0 {
-                println!(
-                    "Success! encoded ShortMsgNpdu, {} bytes {} bits",
-                    enc_rval.encoded / 8,
-                    enc_rval.encoded % 8,
-                );
-                let num_bytes = enc_rval.encoded / 8;
-                encoded_data.resize(num_bytes as usize, 0);
+        if let Some(encoded_data) =
+            uper_encode_full::<ShortMsgNpdu_t>(&short_msg, &mut encoded_data)
+        {
+            if let Some(msg) = uper_decode_full::<ShortMsgNpdu_t>(&encoded_data) {
+                unsafe {
+                    // access to union field is unsafe
+                    assert_eq!(msg.subtype.choice.nullNetworking.version, 2);
+                    assert_eq!(msg.transport.choice.bcMode.destAddress.choice.content, 12);
+                }
             } else {
-                panic!("Encode ShortMsgNpdu failed,  {}", enc_rval.encoded);
+                panic!("Decode failed")
             }
+        } else {
+            panic!("Encode failed");
         }
     }
 }
